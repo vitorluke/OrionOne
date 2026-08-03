@@ -10,44 +10,30 @@ class Depth:
         self.fx = 2284.4439266807667
         self.baseline = 0.29331903822053373
 
-        # CLAHE para melhorar contraste
+        # Melhora o contraste
         self.clahe = cv2.createCLAHE(
             clipLimit=2.0,
             tileGridSize=(8, 8)
         )
 
-        # Matcher esquerdo
-        self.left_matcher = cv2.StereoSGBM_create(
+        self.stereo = cv2.StereoSGBM_create(
             minDisparity=0,
-            numDisparities=16 * 12,
+            numDisparities=16 * 8,      # 128
             blockSize=7,
 
             P1=8 * 3 * 7**2,
             P2=32 * 3 * 7**2,
 
             disp12MaxDiff=1,
-            uniquenessRatio=15,
+            uniquenessRatio=12,
 
-            speckleWindowSize=200,
+            speckleWindowSize=100,
             speckleRange=2,
 
             preFilterCap=63,
 
-            mode=cv2.STEREO_SGBM_MODE_HH
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
         )
-
-        # Matcher direito
-        self.right_matcher = cv2.ximgproc.createRightMatcher(
-            self.left_matcher
-        )
-
-        # Filtro WLS
-        self.wls_filter = cv2.ximgproc.createDisparityWLSFilter(
-            self.left_matcher
-        )
-
-        self.wls_filter.setLambda(8000)
-        self.wls_filter.setSigmaColor(1.5)
 
         self.disparity = None
         self.depth = None
@@ -70,25 +56,12 @@ class Depth:
         gray_left = self.clahe.apply(gray_left)
         gray_right = self.clahe.apply(gray_right)
 
-        left_disp = self.left_matcher.compute(
+        disparity = self.stereo.compute(
             gray_left,
             gray_right
-        )
+        ).astype(np.float32) / 16.0
 
-        right_disp = self.right_matcher.compute(
-            gray_right,
-            gray_left
-        )
-
-        disparity = self.wls_filter.filter(
-            left_disp,
-            gray_left,
-            disparity_map_right=right_disp
-        )
-
-        disparity = disparity.astype(np.float32) / 16.0
-
-        disparity = cv2.medianBlur(disparity, 5)
+        disparity = cv2.medianBlur(disparity, 3)
 
         disparity[disparity <= 0] = np.nan
 
