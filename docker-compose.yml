@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  # Container 1: Backend em Python (instala requisitos e roda a aplicação)
+  backend:
+    image: python:3.11-slim
+    container_name: camera_backend
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "5000:5000"
+    environment:
+      - WEB_FEED=True
+      - CAMERAS_PORT=5000
+    volumes:
+      - .:/app
+    # Adicionado o iputils-ping para a câmera e alterado para capture_orion.py
+    command: >
+      sh -c "apt-get update && apt-get install -y libgl1 libglib2.0-0 iputils-ping &&
+             pip install --no-cache-dir -r requirements.txt &&
+             python capture_orion.py"
+
+  # Container 2: Frontend em Nginx (Mapeia o HTML e CSS das suas pastas)
+  frontend:
+    image: nginx:alpine
+    container_name: camera_frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./templates/index.html:/usr/share/nginx/html/index.html:ro
+      - ./static/style.css:/usr/share/nginx/html/style.css:ro
+    depends_on:
+      - backend
