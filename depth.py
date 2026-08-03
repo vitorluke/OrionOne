@@ -10,22 +10,44 @@ class Depth:
         self.fx = 2284.4439266807667
         self.baseline = 0.29331903822053373
 
-        self.stereo = cv2.StereoSGBM_create(
-            minDisparity=0,
-            numDisparities=128,
-            blockSize=5,
+        # CLAHE para melhorar contraste
+        self.clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8)
+        )
 
-            P1=8 * 3 * 5**2,
-            P2=32 * 3 * 5**2,
+        # Matcher esquerdo
+        self.left_matcher = cv2.StereoSGBM_create(
+            minDisparity=0,
+            numDisparities=16 * 12,
+            blockSize=7,
+
+            P1=8 * 3 * 7**2,
+            P2=32 * 3 * 7**2,
 
             disp12MaxDiff=1,
-            uniquenessRatio=10,
-            speckleWindowSize=100,
-            speckleRange=32,
+            uniquenessRatio=15,
+
+            speckleWindowSize=200,
+            speckleRange=2,
 
             preFilterCap=63,
-            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
+
+            mode=cv2.STEREO_SGBM_MODE_HH
         )
+
+        # Matcher direito
+        self.right_matcher = cv2.ximgproc.createRightMatcher(
+            self.left_matcher
+        )
+
+        # Filtro WLS
+        self.wls_filter = cv2.ximgproc.createDisparityWLSFilter(
+            self.left_matcher
+        )
+
+        self.wls_filter.setLambda(8000)
+        self.wls_filter.setSigmaColor(1.5)
 
         self.disparity = None
         self.depth = None
@@ -35,19 +57,48 @@ class Depth:
         if left_frame is None or right_frame is None:
             return None
 
-        gray_left = cv2.cvtColor(left_frame, cv2.COLOR_BGR2GRAY)
-        gray_right = cv2.cvtColor(right_frame, cv2.COLOR_BGR2GRAY)
+        gray_left = cv2.cvtColor(
+            left_frame,
+            cv2.COLOR_BGR2GRAY
+        )
 
-        disparity = self.stereo.compute(
+        gray_right = cv2.cvtColor(
+            right_frame,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        gray_left = self.clahe.apply(gray_left)
+        gray_right = self.clahe.apply(gray_right)
+
+        left_disp = self.left_matcher.compute(
             gray_left,
             gray_right
-        ).astype(np.float32) / 16.0
+        )
+
+        right_disp = self.right_matcher.compute(
+            gray_right,
+            gray_left
+        )
+
+        disparity = self.wls_filter.filter(
+            left_disp,
+            gray_left,
+            disparity_map_right=right_disp
+        )
+
+        disparity = disparity.astype(np.float32) / 16.0
+
+        disparity = cv2.medianBlur(disparity, 5)
 
         disparity[disparity <= 0] = np.nan
 
         self.disparity = disparity
 
-        depth = np.full(disparity.shape, np.nan, dtype=np.float32)
+        depth = np.full(
+            disparity.shape,
+            np.nan,
+            dtype=np.float32
+        )
 
         valid = np.isfinite(disparity)
 
@@ -72,13 +123,18 @@ class Depth:
 
         disp = np.nan_to_num(self.disparity)
 
-        return cv2.normalize(
+        disp = cv2.normalize(
             disp,
             None,
             0,
             255,
             cv2.NORM_MINMAX
         ).astype(np.uint8)
+
+        return cv2.applyColorMap(
+            disp,
+            cv2.COLORMAP_TURBO
+        )
 
     def get_depth_image(self, max_depth=10.0):
 
@@ -90,16 +146,20 @@ class Depth:
         depth[np.isnan(depth)] = max_depth
         depth = np.clip(depth, 0, max_depth)
 
-        # Objetos próximos ficam mais claros
         depth = max_depth - depth
 
-        return cv2.normalize(
+        depth = cv2.normalize(
             depth,
             None,
             0,
             255,
             cv2.NORM_MINMAX
         ).astype(np.uint8)
+
+        return cv2.applyColorMap(
+            depth,
+            cv2.COLORMAP_TURBO
+        )
 
     def get_point_distance(self, x, y):
 
@@ -114,9 +174,9 @@ class Depth:
         ):
             return None
 
-        distance = self.depth[y, x]
+        d = self.depth[y, x]
 
-        if np.isnan(distance):
+        if np.isnan(d):
             return None
 
-        return float(distance)
+        return float(d)
