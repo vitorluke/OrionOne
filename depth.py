@@ -1,155 +1,167 @@
 import cv2
 import numpy as np
+import yaml
+import logging
+import os
 
+# Tenta importar o módulo extra para o Filtro WLS (Alta Qualidade)
+try:
+    import cv2.ximgproc
+    HAS_XIMGPROC = True
+except ImportError:
+    HAS_XIMGPROC = False
+    logging.warning("Módulo cv2.ximgproc não encontrado. Para bordas de precisão milimétrica, instale: pip install opencv-contrib-python")
 
 class Depth:
+    def __init__(self, config_path="config/sgbm_params.yaml"):
+        """
+        Processador de Profundidade de Alta Precisão.
+        Garante a preservação dos dados matemáticos em float32 para cálculos milimétricos.
+        """
+        self.disparity_color = None
+        self.disparity_raw = None
+        
+        # Valores de fábrica extraídos diretamente do SDK (stereo_disparity_node.py)[cite: 2]
+        self.params = {
+            "num_disparities":    336,
+            "min_disparity":       48,
+            "block_size":           9,
+            "p1_factor":            8,
+            "p2_factor":           32,
+            "disp12_max_diff":      2,
+            "uniqueness_ratio":    10,
+            "speckle_window_size": 120,
+            "speckle_range":        2,
+            "pre_filter_cap":      63,
+            "mode":                 2,  # 2 equivale a cv2.STEREO_SGBM_MODE_SGBM_3WAY[cite: 2]
+            "proc_scale":          0.5
+        }
+        
+        self._load_yaml_params(config_path)
+        self._rebuild_sgbm()
 
-    def __init__(self):
+    def _load_yaml_params(self, config_path):
+        """Lê os parâmetros de calibração do arquivo YAML no formato do ROS2[cite: 2]."""
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as file:
+                    data = yaml.safe_load(file)
+                    
+                    # Procura a estrutura específica que o ROS2 utiliza[cite: 2]
+                    if data and '/stereo_disparity_node' in data:
+                        node_data = data['/stereo_disparity_node']
+                        if 'ros__parameters' in node_data:
+                            for key, val in node_data['ros__parameters'].items():
+                                if key in self.params:
+                                    self.params[key] = val
+                            logging.info(f"Parâmetros de alta precisão carregados de {config_path}")
+            except Exception as e:
+                logging.error(f"Erro ao ler {config_path}: {e}. Usando fallback do SDK.")
 
-        # Parâmetros da calibração
-        self.fx = 2284.4439266807667
-        self.baseline = 0.29331903822053373
-
-        # Melhora o contraste
-        self.clahe = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8, 8)
+    def _rebuild_sgbm(self):
+        """Constrói os objetos do SGBM com as regras matemáticas originais do SDK[cite: 2]."""
+        bs = self.params["block_size"]
+        if bs % 2 == 0:
+            bs += 1
+            
+        nd = max(16, (self.params["num_disparities"] // 16) * 16)
+        
+        mode_map = {
+            0: cv2.STEREO_SGBM_MODE_SGBM,
+            1: cv2.STEREO_SGBM_MODE_HH,
+            2: cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+            3: cv2.STEREO_SGBM_MODE_HH4,
+        }
+        
+        # Matcher Esquerdo (Principal)
+        self.left_matcher = cv2.StereoSGBM_create(
+            minDisparity      = self.params["min_disparity"],
+            numDisparities    = nd,
+            blockSize         = bs,
+            P1                = self.params["p1_factor"] * 3 * bs ** 2, # Penaliza pequenas mudanças[cite: 2]
+            P2                = self.params["p2_factor"] * 3 * bs ** 2, # Penaliza grandes mudanças[cite: 2]
+            disp12MaxDiff     = self.params["disp12_max_diff"],
+            uniquenessRatio   = self.params["uniqueness_ratio"],
+            speckleWindowSize = self.params["speckle_window_size"],
+            speckleRange      = self.params["speckle_range"],
+            preFilterCap      = self.params["pre_filter_cap"],
+            mode              = mode_map.get(self.params["mode"], cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         )
+        
+        # Configuração do Filtro WLS para suavização das bordas
+        if HAS_XIMGPROC:
+            self.right_matcher = cv2.ximgproc.createRightMatcher(self.left_matcher)
+            self.wls_filter = cv2.ximgproc.createDisparityWLSFilter(matcher_left=self.left_matcher)
+            self.wls_filter.setLambda(8000.0)
+            self.wls_filter.setSigmaColor(1.5)
 
-        self.stereo = cv2.StereoSGBM_create(
-            minDisparity=0,
-            numDisparities=16 * 8,      # 128
-            blockSize=7,
-
-            P1=8 * 3 * 7**2,
-            P2=32 * 3 * 7**2,
-
-            disp12MaxDiff=1,
-            uniquenessRatio=12,
-
-            speckleWindowSize=100,
-            speckleRange=2,
-
-            preFilterCap=63,
-
-            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
-        )
-
-        self.disparity = None
-        self.depth = None
+        self.min_d = self.params["min_disparity"]
+        self.max_d = self.min_d + nd
+        self.scale = self.params["proc_scale"]
 
     def process(self, left_frame, right_frame):
-
+        """Processa os frames e gera as matrizes (Visual e Matemática)."""
         if left_frame is None or right_frame is None:
-            return None
+            return
 
-        gray_left = cv2.cvtColor(
-            left_frame,
-            cv2.COLOR_BGR2GRAY
-        )
+        h_orig, w_orig = left_frame.shape[:2]
 
-        gray_right = cv2.cvtColor(
-            right_frame,
-            cv2.COLOR_BGR2GRAY
-        )
+        # 1. Redimensionamento para performance, mantendo a regra do SDK[cite: 2]
+        left_s = cv2.resize(left_frame, None, fx=self.scale, fy=self.scale)
+        right_s = cv2.resize(right_frame, None, fx=self.scale, fy=self.scale)
 
-        gray_left = self.clahe.apply(gray_left)
-        gray_right = self.clahe.apply(gray_right)
+        # 2. Conversão obrigatória para tons de cinza
+        gl = cv2.cvtColor(left_s, cv2.COLOR_BGR2GRAY) if len(left_s.shape) == 3 else left_s
+        gr = cv2.cvtColor(right_s, cv2.COLOR_BGR2GRAY) if len(right_s.shape) == 3 else right_s
 
-        disparity = self.stereo.compute(
-            gray_left,
-            gray_right
-        ).astype(np.float32) / 16.0
+        # 3. Processamento Estéreo e Filtro WLS
+        if HAS_XIMGPROC:
+            left_disp = self.left_matcher.compute(gl, gr)
+            right_disp = self.right_matcher.compute(gr, gl)
+            
+            # WLS guia a profundidade usando a imagem original
+            filtered_disp = self.wls_filter.filter(left_disp, left_s, None, right_disp)
+            
+            # Divide por 16.0 garantindo o float32 (casas decimais precisas)[cite: 2]
+            disp_float = filtered_disp.astype(np.float32) / 16.0
+        else:
+            left_disp = self.left_matcher.compute(gl, gr)
+            disp_float = left_disp.astype(np.float32) / 16.0
 
-        disparity = cv2.medianBlur(disparity, 3)
+        # Remove valores inválidos (buracos sem textura ou bordas ocluídas)
+        disp_float[disp_float < self.min_d] = 0
 
-        disparity[disparity <= 0] = np.nan
+        # 4. SALVANDO A MATRIZ DE PRECISÃO (Sem compressão de cores)
+        # Usa INTER_NEAREST para evitar a criação de distâncias falsas por interpolação
+        self.disparity_raw = cv2.resize(disp_float, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
 
-        self.disparity = disparity
+        # 5. GERANDO A IMAGEM VISUAL (Para o Flask/Stream)
+        valid = disp_float >= self.min_d
+        norm = np.zeros(disp_float.shape, dtype=np.uint8)
+        
+        # Achata a profundidade em 255 tons[cite: 2]
+        norm[valid] = np.clip(
+            (disp_float[valid] - self.min_d) / (self.max_d - self.min_d) * 255.0, 
+            0, 255
+        ).astype(np.uint8)
 
-        depth = np.full(
-            disparity.shape,
-            np.nan,
-            dtype=np.float32
-        )
+        # Mapeia as cores e deixa o fundo inválido em preto (0,0,0)
+        disp_color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        disp_color[norm == 0] = [0, 0, 0]
 
-        valid = np.isfinite(disparity)
-
-        depth[valid] = (
-            self.fx * self.baseline
-        ) / disparity[valid]
-
-        self.depth = depth
-
-        return depth
-
-    def get_disparity(self):
-        return self.disparity
-
-    def get_depth(self):
-        return self.depth
+        # Restaura a resolução para a tela web
+        self.disparity_color = cv2.resize(disp_color, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
 
     def get_disparity_image(self):
-
-        if self.disparity is None:
-            return None
-
-        disp = np.nan_to_num(self.disparity)
-
-        disp = cv2.normalize(
-            disp,
-            None,
-            0,
-            255,
-            cv2.NORM_MINMAX
-        ).astype(np.uint8)
-
-        return cv2.applyColorMap(
-            disp,
-            cv2.COLORMAP_TURBO
-        )
-
-    def get_depth_image(self, max_depth=10.0):
-
-        if self.depth is None:
-            return None
-
-        depth = self.depth.copy()
-
-        depth[np.isnan(depth)] = max_depth
-        depth = np.clip(depth, 0, max_depth)
-
-        depth = max_depth - depth
-
-        depth = cv2.normalize(
-            depth,
-            None,
-            0,
-            255,
-            cv2.NORM_MINMAX
-        ).astype(np.uint8)
-
-        return cv2.applyColorMap(
-            depth,
-            cv2.COLORMAP_TURBO
-        )
-
-    def get_point_distance(self, x, y):
-
-        if self.depth is None:
-            return None
-
-        if (
-            x < 0 or
-            y < 0 or
-            x >= self.depth.shape[1] or
-            y >= self.depth.shape[0]
-        ):
-            return None
-
-        d = self.depth[y, x]
-
-        if np.isnan(d):
-            return None
-
-        return float(d)
+        """
+        Retorna a imagem colorida e comprimida (8-bits). 
+        Uso: Transmissão no navegador via Flask.
+        """
+        return self.disparity_color
+        
+    def get_raw_disparity(self):
+        """
+        Retorna a matriz de dados puros (float32). 
+        Uso: Cálculos matemáticos precisos em milímetros (Z = f * B / d).
+        """
+        return self.disparity_raw
