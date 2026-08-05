@@ -2,5 +2,5 @@ scipy
 numpy
 opencv-contrib-python
 Flask
-yaml
+pyyaml
 zmq
