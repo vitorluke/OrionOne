@@ -6,6 +6,7 @@ services:
     image: python:3.11-slim
     container_name: camera_backend
     restart: unless-stopped
+    network_mode: host
     working_dir: /app
     ports:
       - "5000:5000"

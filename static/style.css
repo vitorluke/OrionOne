@@ -5,9 +5,20 @@ body{
     width: auto;
     background-color: black;
     display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 5vh;
+}
+
+#screen{
+    margin: 0;
+    padding: 0;
+    display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: center;
+    gap: 5vw;;
 }
 
 #camera1{
@@ -17,6 +28,11 @@ body{
 
 #camera2{
     display: flex;
+    flex-direction: column;
+}
+
+#disparity{
+    display:flex;
     flex-direction: column;
 }
 
