@@ -142,10 +142,6 @@ def depth_loop():
         if web_feed == True:
             with image_disparity_lock:
                 image_latest_disparity = depth.get_disparity_image().copy()
-       
-        if image_latest_disparity is not None:
-            # Exibe o mapa de profundidade localmente
-            cv2.imshow("Disparity", image_latest_disparity)
 
         if cv2.waitKey(1) == 27: # Pressione ESC para fechar a janela local
             break
@@ -186,7 +182,7 @@ def generate_depth_frames():
     while True:
 
         with image_disparity_lock:
-            if image_latest_disparity != None:
+            if image_latest_disparity is not None:
                 frame = image_latest_disparity.copy()
             else:
                 frame = None
