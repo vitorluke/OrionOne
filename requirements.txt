@@ -1,6 +1,4 @@
 scipy
 numpy
-opencv-contrib-python
-Flask
-pyyaml
+opencv-python
 zmq
