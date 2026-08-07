@@ -11,6 +11,16 @@ body{
     gap: 5vh;
 }
 
+img{
+    color: white;
+    font-family: sans-serif;
+}
+
+#status-webfeed{
+    color: white;
+    font-family: sans-serif;
+}
+
 #screen{
     margin: 0;
     padding: 0;

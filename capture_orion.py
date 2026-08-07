@@ -15,7 +15,7 @@ image_disparity_lock = threading.Lock()
 # Importa a classe principal do novo SDK
 from stereo_4d import Stereo4DCameraHandler
 
-web_feed = getenv("WEB_FEED", "True").lower() == "true"
+web_feed = True
 cameras_port = int(getenv("CAMERAS_PORT", "5000"))
 
 logging.basicConfig(
@@ -23,8 +23,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-if web_feed == True:
-    app = Flask(__name__)
+app = Flask(__name__)
 
 # Armazena o último frame de cada lente (0 = Esquerda, 1 = Direita)
 latest_frames = {0: None, 1: None}
@@ -90,7 +89,7 @@ def capture_loop():
 def generate_frames(camera_id):
     global latest_frames
 
-    while True:
+    while web_feed:
 
         with frame_lock: 
             if latest_frames[camera_id] is not None:
@@ -119,32 +118,44 @@ def generate_frames(camera_id):
 def depth_loop():
     global latest_disparity,image_latest_disparity
     while True:
-       
+        try:
+            with frame_lock:
+                if latest_frames[0] is not None and latest_frames[1] is not None:
+                    left = latest_frames[0].copy()
+                    right = latest_frames[1].copy()
+                else:
+                    left = None
+                    right = None
 
-        with frame_lock:
-            if latest_frames[0] is not None and latest_frames[1] is not None:
-                left = latest_frames[0].copy()
-                right = latest_frames[1].copy()
-            else:
-                left = None
-                right = None
+            if left is None or right is None:
+                time.sleep(0.01)
+                continue
 
-        if left is None or right is None:
+            depth.process(left, right)
+
+            with disparity_lock:
+                latest_disparity = depth.get_raw_disparity().copy()
+
+            if web_feed == True:
+                with image_disparity_lock:
+                    image_latest_disparity = depth.get_disparity_image().copy()
+
+
             time.sleep(0.01)
-            continue
 
-        # Processa a profundidade usando a classe Depth inalterada
-        depth.process(left, right)
+        except cv2.error as e:
+            logging.warning(f"[OpenCV Error] Falha no cálculo SGBM: {e}")
+            time.sleep(0.025)
 
-        with disparity_lock:
-            latest_disparity = depth.get_raw_disparity().copy()
+        except AttributeError as e:
+            logging.warning(
+                f"[AttributeError] Tentativa de ler imagem/matriz nula: {e}"
+            )
+            time.sleep(0.05)
 
-        if web_feed == True:
-            with image_disparity_lock:
-                image_latest_disparity = depth.get_disparity_image().copy()
-
-        if cv2.waitKey(1) == 27: # Pressione ESC para fechar a janela local
-            break
+        except Exception as e:
+            logging.error(f"[Erro Desconhecido] Na thread depth_loop: {e}")
+            time.sleep(0.1)
 
 def depth_map():
     """
@@ -179,7 +190,7 @@ def depth_map():
 
 def generate_depth_frames():
 
-    while True:
+    while web_feed:
 
         with image_disparity_lock:
             if image_latest_disparity is not None:
@@ -217,31 +228,44 @@ threading.Thread(
     daemon=True
 ).start()
 
-if web_feed == True:
-    @app.route("/video0")
-    def video0():
+@app.route("/video0")
+def video0():
+    if web_feed == True:
         return Response(
             generate_frames(0),
             mimetype="multipart/x-mixed-replace; boundary=frame"
         )
-
-    @app.route("/video1")
-    def video1():
+    else:
+        return "Offline"
+@app.route("/video1")
+def video1():
+    if web_feed == True:
         return Response(
             generate_frames(1),
             mimetype="multipart/x-mixed-replace; boundary=frame"
         )
+    else:
+        return "Offline"
 
-    @app.route("/disparity")
-    def disparity():
+@app.route("/disparity")
+def disparity():
+    if web_feed == True:
         return Response(
             generate_depth_frames(),
             mimetype="multipart/x-mixed-replace; boundary=frame"
         )
-    
+    else:
+        return "Offline"
 
-    app.run(
-        host="0.0.0.0",
-        port=cameras_port,
-        threaded=True
-    )
+@app.route("/webfeed")
+def webfeed():
+    global web_feed
+    web_feed = not web_feed
+    status = "LIGADO" if web_feed else "DESLIGADO"
+    return f"Webfeed alterado para {status}", 200
+
+app.run(
+    host="0.0.0.0",
+    port=cameras_port,
+    threaded = True
+)

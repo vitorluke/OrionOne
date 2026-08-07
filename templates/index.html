@@ -13,21 +13,74 @@
 
     <div id="screen">
 
-        <div id="camera1">
+        <div  id="camera1">
             <h2 class="white-text">Camera 1</h2>
-            <img src="http://localhost:5000/video0">
+            <img alt="Offline" id="video0" src="http://localhost:5000/video0">
         </div>
 
-        <div id="camera2">
+        <div  id="camera2">
             <h2 class ="white-text">Camera 2</h2>
-            <img src="http://localhost:5000/video1">
+            <img alt="Offline" id="video1" src="http://localhost:5000/video1">
         </div>
     </div>
 
     <div id="disparity">
         <h2 class="white-text">Disparity</h2>
-        <img src="http://localhost:5000/disparity"
+        <img id="disparity_feed" alt="Offline" src="http://localhost:5000/disparity">
     </div>
+
+    <button id="btn-webfeed" onclick="alternarWebFeed()">Alternar Webfeed</button>
+    <p id="status-webfeed">Status do Feed: ---</p>
+
+    <script>
+    async function alternarWebFeed(){
+        try {
+            const response = await fetch('http://localhost:5000/webfeed');
+            const textoStatus = await response.text();
+
+            document.getElementById('status-webfeed').innerText = textoStatus;
+
+            if (textoStatus.includes("DESLIGADO")) {
+                recarregarFeeds(false);
+            }
+
+            else if (textoStatus.includes("LIGADO")){
+                recarregarFeeds(true);
+            }
+
+        } catch (error) {
+            console.error('Erro ao chamar a rota /webfeed:', error);
+        }
+
+    
+
+        
+    }
+
+    function recarregarFeeds(feed_status) {
+        const timestamp = new Date().getTime();
+        const imgVideo0 = document.getElementById('video0');
+        if (imgVideo0) imgVideo0.src = 'http://localhost:5000/video0?' + timestamp;
+        const imgVideo1 = document.getElementById('video1');
+        if (imgVideo1) imgVideo1.src = 'http://localhost:5000/video1?'+ timestamp;
+        const imgdisparity = document.getElementById('disparity_feed');
+        if (imgdisparity) imgdisparity.src = 'http://localhost:5000/disparity?'+ timestamp;
+
+        const button = document.getElementById('btn-webfeed');
+        const status_text = document.getElementById('status-webfeed');
+        
+        if (feed_status){
+            button.style.backgroundColor = 'green';
+            status_text.innerText = 'Status do Feed: ON';
+        }
+
+        else{
+            button.style.backgroundColor = 'red';
+            status_text.innerText = 'Status do Feed: OFF';
+        }
+
+    }
+    </script>
 
 </body>
 </html>
