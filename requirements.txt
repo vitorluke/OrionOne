@@ -1,4 +1,6 @@
-scipy
+Flask
 numpy
-opencv-python
-zmq
+scipy
+PyYAML
+pyzmq
+opencv-contrib-python-headless

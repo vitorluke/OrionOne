@@ -157,7 +157,7 @@ def depth_loop():
             logging.error(f"[Erro Desconhecido] Na thread depth_loop: {e}")
             time.sleep(0.1)
 
-def depth_map():
+def depth_map(min_depth_m = None, max_depth_m = None):
     """
     Calcula o mapa de profundidade completo em metros (matriz numpy float32)
     para todos os pixels, utilizando a disparidade crua e os dados do SDK da câmera.

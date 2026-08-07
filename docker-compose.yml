@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # Container 1: Backend em Python (instala requisitos e roda a aplicação)
   backend:
-    image: python:3.11-slim
+    image: arm64v8/python:3.11-slim
     container_name: camera_backend
     restart: unless-stopped
     network_mode: host

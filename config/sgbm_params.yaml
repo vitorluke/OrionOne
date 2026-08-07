@@ -1,9 +1,9 @@
 /stereo_disparity_node:
   ros__parameters:
     profile: "scale_04"
-    num_disparities: 224
+    num_disparities: 256
     min_disparity: 25
-    block_size: 6
+    block_size: 4
     p1_factor: 4
     p2_factor: 16
     disp12_max_diff: 2
