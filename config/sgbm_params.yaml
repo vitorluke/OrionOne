@@ -3,7 +3,7 @@
     profile: "scale_04"
     num_disparities: 256
     min_disparity: 25
-    block_size: 4
+    block_size: 5
     p1_factor: 4
     p2_factor: 16
     disp12_max_diff: 2

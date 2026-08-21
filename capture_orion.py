@@ -16,6 +16,7 @@ image_disparity_lock = threading.Lock()
 from stereo_4d import Stereo4DCameraHandler
 
 web_feed = True
+depth_calc = True
 cameras_port = int(getenv("CAMERAS_PORT", "5000"))
 
 logging.basicConfig(
@@ -118,6 +119,9 @@ def generate_frames(camera_id):
 def depth_loop():
     global latest_disparity,image_latest_disparity
     while True:
+        if depth_calc == False:
+            time.sleep(0.02)
+            continue
         try:
             with frame_lock:
                 if latest_frames[0] is not None and latest_frames[1] is not None:
@@ -249,7 +253,7 @@ def video1():
 
 @app.route("/disparity")
 def disparity():
-    if web_feed == True:
+    if web_feed == True and depth_calc == True:
         return Response(
             generate_depth_frames(),
             mimetype="multipart/x-mixed-replace; boundary=frame"

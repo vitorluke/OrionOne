@@ -79,7 +79,20 @@
             status_text.innerText = 'Status do Feed: OFF';
         }
 
+        
+
     }
+
+    const disparity_img = document.getElementById('disparity_feed');
+    function retry() {
+        let timestamp_1 = new Date().getTime();
+        if(disparity_img) disparity_img.src = 'http://localhost:5000/disparity?' + timestamp_1;
+        console.log('retry on disparity feed!')
+    }
+
+    disparity_img.onerror = () => {
+        setTimeout(retry, 3000);
+    };
     </script>
 
 </body>
