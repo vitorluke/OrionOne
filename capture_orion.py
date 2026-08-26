@@ -119,9 +119,6 @@ def generate_frames(camera_id):
 def depth_loop():
     global latest_disparity,image_latest_disparity
     while True:
-        if depth_calc == False:
-            time.sleep(0.02)
-            continue
         try:
             with frame_lock:
                 if latest_frames[0] is not None and latest_frames[1] is not None:
@@ -134,6 +131,9 @@ def depth_loop():
             if left is None or right is None:
                 time.sleep(0.01)
                 continue
+
+            if camera.stereo_maps_set:
+                left, right, _, _ = camera.rectify_stereo_images(left, right)
 
             depth.process(left, right)
 
@@ -177,8 +177,11 @@ def depth_map(min_depth_m = None, max_depth_m = None):
     if camera.left_camera_info is None:
         return None
 
-    # Extrai os parâmetros reais diretamente do objeto camera[cite: 10]
-    focal_length = camera.left_camera_info.k[0, 0]  # f_x em pixels[cite: 10]
+    if camera.left_rect_k is not None:
+        focal_length = camera.left_rect_k[0,0]
+    else:
+        focal_length = camera.left_camera_info.k[0,0]
+        
     baseline = camera.left_camera_info.extrinsic_matrix[0, 3]  # Linha de base em metros[cite: 10]
 
     # Cria uma matriz de zeros com o mesmo formato da disparidade
@@ -189,6 +192,12 @@ def depth_map(min_depth_m = None, max_depth_m = None):
 
     # Cálculo vetorizado para todos os pixels válidos de uma só vez: Z = (f * B) / d
     depth_map[valid_mask] = (focal_length * baseline) / disp_map[valid_mask]
+
+    if min_depth_m is not None:
+        depth_map[depth_map < min_depth_m] = 0
+
+    if max_depth_m is not None:
+        depth_map[depth_map< min_depth_m] = 0
 
     return depth_map
 
