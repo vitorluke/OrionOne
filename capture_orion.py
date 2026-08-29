@@ -132,9 +132,6 @@ def depth_loop():
                 time.sleep(0.01)
                 continue
 
-            if camera.stereo_maps_set:
-                left, right, _, _ = camera.rectify_stereo_images(left, right)
-
             depth.process(left, right)
 
             with disparity_lock:
@@ -177,10 +174,7 @@ def depth_map(min_depth_m = None, max_depth_m = None):
     if camera.left_camera_info is None:
         return None
 
-    if camera.left_rect_k is not None:
-        focal_length = camera.left_rect_k[0,0]
-    else:
-        focal_length = camera.left_camera_info.k[0,0]
+    focal_length = camera.left_camera_info.k[0,0]
         
     baseline = camera.left_camera_info.extrinsic_matrix[0, 3]  # Linha de base em metros[cite: 10]
 
