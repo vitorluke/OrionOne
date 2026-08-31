@@ -7,7 +7,7 @@ import os
 # Tenta importar o módulo extra para o Filtro WLS (Alta Qualidade)
 try:
     import cv2.ximgproc
-    HAS_XIMGPROC = False
+    HAS_XIMGPROC = True
 except ImportError:
     HAS_XIMGPROC = False
     logging.warning("Módulo cv2.ximgproc não encontrado. Para bordas de precisão milimétrica, instale: pip install opencv-contrib-python")

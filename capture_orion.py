@@ -88,9 +88,13 @@ def capture_loop():
 
 
 def generate_frames(camera_id):
-    global latest_frames
+    global latest_frames,web_feed
 
-    while web_feed:
+    while True:
+
+        if(web_feed == False):
+            time.sleep(0.033)
+            continue
 
         with frame_lock: 
             if latest_frames[camera_id] is not None:
@@ -117,8 +121,13 @@ def generate_frames(camera_id):
 
 
 def depth_loop():
-    global latest_disparity,image_latest_disparity
+    global latest_disparity,image_latest_disparity,depth_loop
     while True:
+
+        if(depth_loop == False):
+            time.sleep(0.033)
+            continue
+
         try:
             with frame_lock:
                 if latest_frames[0] is not None and latest_frames[1] is not None:
@@ -196,8 +205,9 @@ def depth_map(min_depth_m = None, max_depth_m = None):
     return depth_map
 
 def generate_depth_frames():
+    global web_feed
 
-    while web_feed:
+    while True:
 
         with image_disparity_lock:
             if image_latest_disparity is not None:
@@ -237,6 +247,7 @@ threading.Thread(
 
 @app.route("/video0")
 def video0():
+    global web_feed
     if web_feed == True:
         return Response(
             generate_frames(0),
@@ -246,6 +257,7 @@ def video0():
         return "Offline"
 @app.route("/video1")
 def video1():
+    global web_feed
     if web_feed == True:
         return Response(
             generate_frames(1),
@@ -256,6 +268,7 @@ def video1():
 
 @app.route("/disparity")
 def disparity():
+    global web_feed,depth_calc
     if web_feed == True and depth_calc == True:
         return Response(
             generate_depth_frames(),
@@ -270,6 +283,10 @@ def webfeed():
     web_feed = not web_feed
     status = "LIGADO" if web_feed else "DESLIGADO"
     return f"Webfeed alterado para {status}", 200
+
+@app.route("/depth-map")
+def profundidade():
+    return f"{depth_map()}"
 
 app.run(
     host="0.0.0.0",

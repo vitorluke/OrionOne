@@ -1,6 +1,6 @@
 Flask
-numpy
+numpy==1.26.4
 scipy
 PyYAML
 pyzmq
-opencv-contrib-python-headless
+opencv-contrib-python-headless==4.14.0
