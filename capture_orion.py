@@ -12,17 +12,6 @@ from depth import Depth
 CONFIG_PATH = "config/sgbm_params.yaml"
 
 params = {
-    "num_disparities": 336,
-    "min_disparity": 48,
-    "block_size": 9,
-    "p1_factor": 8,
-    "p2_factor": 32,
-    "disp12_max_diff": 2,
-    "uniqueness_ratio": 10,
-    "speckle_window_size": 120,
-    "speckle_range": 2,
-    "pre_filter_cap": 63,
-    "mode": 2,
     "proc_scale": 0.5,
     "min_depth": 0.1,
     "max_depth":0.1,
