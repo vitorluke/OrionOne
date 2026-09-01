@@ -78,8 +78,8 @@ class Depth:
             minDisparity      = self.params["min_disparity"],
             numDisparities    = nd,
             blockSize         = bs,
-            P1                = self.params["p1_factor"] * 3 * bs ** 2, # Penaliza pequenas mudanças[cite: 2]
-            P2                = self.params["p2_factor"] * 3 * bs ** 2, # Penaliza grandes mudanças[cite: 2]
+            P1                = self.params["p1_factor"] * 1 * bs ** 2, # Penaliza pequenas mudanças[cite: 2]
+            P2                = self.params["p2_factor"] * 1 * bs ** 2, # Penaliza grandes mudanças[cite: 2]
             disp12MaxDiff     = self.params["disp12_max_diff"],
             uniquenessRatio   = self.params["uniqueness_ratio"],
             speckleWindowSize = self.params["speckle_window_size"],
@@ -133,7 +133,7 @@ class Depth:
 
         # 4. SALVANDO A MATRIZ DE PRECISÃO (Sem compressão de cores)
         # Usa INTER_NEAREST para evitar a criação de distâncias falsas por interpolação
-        self.disparity_raw = cv2.resize(disp_float, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+        self.disparity_raw = disp_float
 
         # 5. GERANDO A IMAGEM VISUAL (Para o Flask/Stream)
         valid = disp_float >= self.min_d
@@ -150,7 +150,7 @@ class Depth:
         disp_color[norm == 0] = [0, 0, 0]
 
         # Restaura a resolução para a tela web
-        self.disparity_color = cv2.resize(disp_color, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+        self.disparity_color = disp_color
 
     def get_disparity_image(self):
         """

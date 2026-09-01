@@ -3,9 +3,62 @@ import logging
 import threading
 import time
 import numpy as np
+import os
+import yaml
 from flask import Flask, Response
-from os import getenv
 from depth import Depth
+
+
+CONFIG_PATH = "config/sgbm_params.yaml"
+
+params = {
+    "num_disparities": 336,
+    "min_disparity": 48,
+    "block_size": 9,
+    "p1_factor": 8,
+    "p2_factor": 32,
+    "disp12_max_diff": 2,
+    "uniqueness_ratio": 10,
+    "speckle_window_size": 120,
+    "speckle_range": 2,
+    "pre_filter_cap": 63,
+    "mode": 2,
+    "proc_scale": 0.5,
+    "min_depth": 0.1,
+    "max_depth":0.1,
+}
+
+def load_params(config_path):
+    if not os.path.exists(config_path):
+        logging.warning(
+            f"YAML não encontrado: {config_path}. "
+            "Usando parâmetros padrão."
+        )
+        return params
+
+    try:
+        with open(config_path, "r") as file:
+            data = yaml.safe_load(file)
+
+        ros_params = data["/stereo_disparity_node"]["ros__parameters"]
+
+        for key, value in ros_params.items():
+            if key in params:
+                params[key] = value
+
+        logging.info(f"Parâmetros carregados de {config_path}")
+
+    except Exception as e:
+        logging.error(f"Erro ao carregar YAML: {e}")
+
+    return params
+
+params = load_params(CONFIG_PATH)
+
+scale = float(params["proc_scale"])
+min_depth = float(params["min_depth"])
+max_depth = float(params["max_depth"])
+
 
 #Thread Lock
 frame_lock = threading.Lock()
@@ -17,7 +70,7 @@ from stereo_4d import Stereo4DCameraHandler
 
 web_feed = True
 depth_calc = True
-cameras_port = int(getenv("CAMERAS_PORT", "5000"))
+cameras_port = int(os.getenv("CAMERAS_PORT", "5000"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,7 +177,7 @@ def depth_loop():
     global latest_disparity,image_latest_disparity,depth_loop
     while True:
 
-        if(depth_loop == False):
+        if(depth_calc == False):
             time.sleep(0.033)
             continue
 
@@ -151,8 +204,6 @@ def depth_loop():
                     image_latest_disparity = depth.get_disparity_image().copy()
 
 
-            time.sleep(0.01)
-
         except cv2.error as e:
             logging.warning(f"[OpenCV Error] Falha no cálculo SGBM: {e}")
             time.sleep(0.025)
@@ -167,40 +218,46 @@ def depth_loop():
             logging.error(f"[Erro Desconhecido] Na thread depth_loop: {e}")
             time.sleep(0.1)
 
-def depth_map(min_depth_m = None, max_depth_m = None):
-    """
-    Calcula o mapa de profundidade completo em metros (matriz numpy float32)
-    para todos os pixels, utilizando a disparidade crua e os dados do SDK da câmera.
-    """
-    global latest_disparity
+def depth_map(min_depth_m=min_depth, max_depth_m=max_depth):
+
+    global latest_disparity,scale
 
     with disparity_lock:
         if latest_disparity is None:
             return None
+
         disp_map = latest_disparity.copy()
 
-    # Verifica se as informações da câmera estão disponíveis no SDK[cite: 10]
     if camera.left_camera_info is None:
         return None
 
-    focal_length = camera.left_camera_info.k[0,0]
-        
-    baseline = camera.left_camera_info.extrinsic_matrix[0, 3]  # Linha de base em metros[cite: 10]
+    # Intrínseca original da câmera
+    fx_original = camera.left_camera_info.k[0, 0]
 
-    # Cria uma matriz de zeros com o mesmo formato da disparidade
+    # Ajusta fx para a resolução processada
+    fx = fx_original * scale
+
+    # Baseline
+    baseline = abs(
+        camera.left_camera_info.extrinsic_matrix[0, 3]
+    )
+
+    # Z = f * B / d
     depth_map = np.zeros_like(disp_map, dtype=np.float32)
 
-    # Identifica pixels onde a disparidade é válida (maior que zero)
     valid_mask = disp_map > 0
 
-    # Cálculo vetorizado para todos os pixels válidos de uma só vez: Z = (f * B) / d
-    depth_map[valid_mask] = (focal_length * baseline) / disp_map[valid_mask]
+    depth_map[valid_mask] = (
+        fx * baseline
+    ) / disp_map[valid_mask]
 
+    # Limite mínimo
     if min_depth_m is not None:
         depth_map[depth_map < min_depth_m] = 0
 
+    # Limite máximo
     if max_depth_m is not None:
-        depth_map[depth_map< min_depth_m] = 0
+        depth_map[depth_map > max_depth_m] = 0
 
     return depth_map
 
