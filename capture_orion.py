@@ -174,7 +174,7 @@ def generate_frames(camera_id):
 
 
 def depth_loop():
-    global latest_disparity,image_latest_disparity,depth_loop
+    global latest_disparity,image_latest_disparity,depth_calc
     while True:
 
         if(depth_calc == False):
