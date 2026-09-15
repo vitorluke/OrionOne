@@ -7,7 +7,7 @@ import os
 # Tenta importar o módulo extra para o Filtro WLS (Alta Qualidade)
 try:
     import cv2.ximgproc
-    HAS_XIMGPROC = True
+    HAS_XIMGPROC = False
 except ImportError:
     HAS_XIMGPROC = False
     logging.warning("Módulo cv2.ximgproc não encontrado. Para bordas de precisão milimétrica, instale: pip install opencv-contrib-python")
@@ -121,7 +121,7 @@ class Depth:
             
             # WLS guia a profundidade usando a imagem original
             filtered_disp = self.wls_filter.filter(left_disp, left_s, None, right_disp)
-            
+             
             # Divide por 16.0 garantindo o float32 (casas decimais precisas)[cite: 2]
             disp_float = filtered_disp.astype(np.float32) / 16.0
         else:
