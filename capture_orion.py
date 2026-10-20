@@ -1,14 +1,24 @@
 import cv2
 import logging
 import threading
-import time
+from time import sleep
+from time import perf_counter
 import numpy as np
-import os
+from os import getenv
+from os import path
 import yaml
-from flask import Flask, Response
-from depth import Depth
+from disparity import Disparity
 
 
+#Ferramentas de Benchmark
+fps_monitoring = True
+if fps_monitoring:
+    disparity = 0.0
+    disparity_count = 0
+    disparity_fps_time = perf_counter()
+
+#Configuração de Parâmetros para o cálculo da profundidade
+#Futuramente é recomendado ajustar essa implemntação pois ela gera uma duplicata desnecessária dos dados
 CONFIG_PATH = "config/sgbm_params.yaml"
 
 params = {
@@ -16,9 +26,11 @@ params = {
     "min_depth": 0.1,
     "max_depth":0.1,
 }
+#Fim da configuração dos parâmetros
 
+#Carrega os Parâmetros localizados no Arquivo
 def load_params(config_path):
-    if not os.path.exists(config_path):
+    if not path.exists(config_path):
         logging.warning(
             f"YAML não encontrado: {config_path}. "
             "Usando parâmetros padrão."
@@ -47,9 +59,10 @@ params = load_params(CONFIG_PATH)
 scale = float(params["proc_scale"])
 min_depth = float(params["min_depth"])
 max_depth = float(params["max_depth"])
+#Fim do carregamento dos parâmetros
 
 
-#Thread Lock
+#Thread Lock - Necessária para evitar Race Condition
 frame_lock = threading.Lock()
 disparity_lock = threading.Lock()
 image_disparity_lock = threading.Lock()
@@ -57,16 +70,24 @@ image_disparity_lock = threading.Lock()
 # Importa a classe principal do novo SDK
 from stereo_4d import Stereo4DCameraHandler
 
-web_feed = True
+with open("config.txt", "r", encoding="utf-8") as arquivo:
+    conteudo = arquivo.read()
+if conteudo == "web_feed = true":
+    web_feed = True
+else:
+    web_feed = False
+
+if web_feed:
+    from flask import Flask, Response
+    app = Flask(__name__)
+
 depth_calc = True
-cameras_port = int(os.getenv("CAMERAS_PORT", "5000"))
+cameras_port = int(getenv("CAMERAS_PORT", "5000"))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-app = Flask(__name__)
 
 # Armazena o último frame de cada lente (0 = Esquerda, 1 = Direita)
 latest_frames = {0: None, 1: None}
@@ -74,7 +95,7 @@ image_latest_disparity = None
 latest_disparity = None
 
 # Profundidade
-depth = Depth()
+disparity = Disparity()
 
 # ==========================================
 # INICIALIZAÇÃO DA CÂMERA 4D (REDE)
@@ -122,11 +143,11 @@ def capture_loop():
                     latest_frames[1] = combined_image[:, mid:].copy()
         
             else:
-                time.sleep(0.01)
+                sleep(0.01)
                 
         except Exception as e:
             logging.error(f"Erro no loop de captura: {e}")
-            time.sleep(0.1)
+            sleep(0.1)
 
 
 def generate_frames(camera_id):
@@ -135,7 +156,7 @@ def generate_frames(camera_id):
     while True:
 
         if(web_feed == False):
-            time.sleep(0.033)
+            sleep(0.033)
             continue
 
         with frame_lock: 
@@ -145,10 +166,10 @@ def generate_frames(camera_id):
                 frame = None
 
         if frame is None:
-            time.sleep(0.01)
+            sleep(0.01)
             continue
 
-        frame = cv2.resize(frame, (640, 480))
+        frame = cv2.resize(frame, (426, 240))
         ret, buffer = cv2.imencode(".jpg", frame)
 
         if not ret:
@@ -162,13 +183,10 @@ def generate_frames(camera_id):
         )
 
 
-def depth_loop():
+def disparity_loop():
     global latest_disparity,image_latest_disparity,depth_calc
+    global disparity_fps, disparity_count, disparity_fps_time
     while True:
-
-        if(depth_calc == False):
-            time.sleep(0.033)
-            continue
 
         try:
             with frame_lock:
@@ -180,32 +198,42 @@ def depth_loop():
                     right = None
 
             if left is None or right is None:
-                time.sleep(0.01)
+                sleep(0.33)
                 continue
 
-            depth.process(left, right)
+            disparity.process(left, right)
+
+            if fps_monitoring:
+                disparity_count += 1
+                now = perf_counter()
+                elapsed = now - disparity_fps_time
+
+                if elapsed >= 1.0:
+                    disparity_fps = disparity_count/ elapsed
+                    disparity_count = 0
+                    disparity_fps_time = now
 
             with disparity_lock:
-                latest_disparity = depth.get_raw_disparity().copy()
+                latest_disparity = disparity.get_raw_disparity().copy()
 
             if web_feed == True:
                 with image_disparity_lock:
-                    image_latest_disparity = depth.get_disparity_image().copy()
+                    image_latest_disparity = disparity.get_disparity_image().copy()
 
 
         except cv2.error as e:
             logging.warning(f"[OpenCV Error] Falha no cálculo SGBM: {e}")
-            time.sleep(0.025)
+            sleep(0.025)
 
         except AttributeError as e:
             logging.warning(
                 f"[AttributeError] Tentativa de ler imagem/matriz nula: {e}"
             )
-            time.sleep(0.05)
+            sleep(0.05)
 
         except Exception as e:
             logging.error(f"[Erro Desconhecido] Na thread depth_loop: {e}")
-            time.sleep(0.1)
+            sleep(0.1)
 
 def depth_map(min_depth_m=min_depth, max_depth_m=max_depth):
 
@@ -250,7 +278,7 @@ def depth_map(min_depth_m=min_depth, max_depth_m=max_depth):
 
     return depth_map
 
-def generate_depth_frames():
+def generate_disparity_frames():
     global web_feed
 
     while True:
@@ -262,10 +290,23 @@ def generate_depth_frames():
                 frame = None
 
         if frame is None:
-            time.sleep(0.01)
+            sleep(0.33)
             continue
 
-        frame = cv2.resize(frame, (640,480))
+        frame = cv2.resize(frame, (426,240))
+
+        if fps_monitoring:
+            cv2.putText(
+                frame,
+                f"Disparity FPS: {disparity_fps:.1f}",
+                (10,30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255,255,255),
+                2,
+                cv2.LINE_AA
+            )
+
         ret, buffer = cv2.imencode(".jpg", frame)
 
         if not ret:
@@ -278,6 +319,11 @@ def generate_depth_frames():
             + b'\r\n'
         )
 
+def print_fps_terminal():
+    global disparity_fps
+    while True:
+        print(f"FPS: {disparity_fps}", flush=True)
+        sleep(5)
 
 # Cria APENAS UMA thread de captura, pois o SDK traz as duas lentes juntas
 threading.Thread(
@@ -287,55 +333,35 @@ threading.Thread(
 
 # Mantém a thread de profundidade original
 threading.Thread(
-    target=depth_loop,
+    target=disparity_loop,
     daemon=True
 ).start()
 
-@app.route("/video0")
-def video0():
-    global web_feed
-    if web_feed == True:
+if not web_feed and fps_monitoring:
+    print_fps_terminal()
+
+if web_feed:
+    @app.route("/video0")
+    def video0():
         return Response(
             generate_frames(0),
             mimetype="multipart/x-mixed-replace; boundary=frame"
         )
-    else:
-        return "Offline"
-@app.route("/video1")
-def video1():
-    global web_feed
-    if web_feed == True:
+    @app.route("/video1")
+    def video1():
         return Response(
             generate_frames(1),
             mimetype="multipart/x-mixed-replace; boundary=frame"
         )
-    else:
-        return "Offline"
-
-@app.route("/disparity")
-def disparity():
-    global web_feed,depth_calc
-    if web_feed == True and depth_calc == True:
+    @app.route("/disparity")
+    def disparity():
         return Response(
-            generate_depth_frames(),
+            generate_disparity_frames(),
             mimetype="multipart/x-mixed-replace; boundary=frame"
         )
-    else:
-        return "Offline"
 
-@app.route("/webfeed")
-def webfeed():
-    global web_feed
-    web_feed = not web_feed
-    status = "LIGADO" if web_feed else "DESLIGADO"
-    return f"Webfeed alterado para {status}", 200
-
-@app.route("/depth-map")
-def profundidade():
-    return f"{depth_map()}"
-
-app.run(
-    host="0.0.0.0",
-    port=cameras_port,
-    threaded = True
-)
+    app.run(
+        host="0.0.0.0",
+        port=cameras_port,
+        threaded = True
+    )   

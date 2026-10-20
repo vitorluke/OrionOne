@@ -4,15 +4,7 @@ import yaml
 import logging
 import os
 
-# Tenta importar o módulo extra para o Filtro WLS (Alta Qualidade)
-try:
-    import cv2.ximgproc
-    HAS_XIMGPROC = False
-except ImportError:
-    HAS_XIMGPROC = False
-    logging.warning("Módulo cv2.ximgproc não encontrado. Para bordas de precisão milimétrica, instale: pip install opencv-contrib-python")
-
-class Depth:
+class Disparity:
     def __init__(self, config_path="config/sgbm_params.yaml"):
         """
         Processador de Profundidade de Alta Precisão.
@@ -88,13 +80,6 @@ class Depth:
             mode              = mode_map.get(self.params["mode"], cv2.STEREO_SGBM_MODE_SGBM_3WAY)
         )
         
-        # Configuração do Filtro WLS para suavização das bordas
-        if HAS_XIMGPROC:
-            self.right_matcher = cv2.ximgproc.createRightMatcher(self.left_matcher)
-            self.wls_filter = cv2.ximgproc.createDisparityWLSFilter(matcher_left=self.left_matcher)
-            self.wls_filter.setLambda(8000.0)
-            self.wls_filter.setSigmaColor(1.5)
-
         self.min_d = self.params["min_disparity"]
         self.max_d = self.min_d + nd
         self.scale = self.params["proc_scale"]
@@ -115,18 +100,9 @@ class Depth:
         gr = cv2.cvtColor(right_s, cv2.COLOR_BGR2GRAY) if len(right_s.shape) == 3 else right_s
 
         # 3. Processamento Estéreo e Filtro WLS
-        if HAS_XIMGPROC:
-            left_disp = self.left_matcher.compute(gl, gr)
-            right_disp = self.right_matcher.compute(gr, gl)
-            
-            # WLS guia a profundidade usando a imagem original
-            filtered_disp = self.wls_filter.filter(left_disp, left_s, None, right_disp)
-             
-            # Divide por 16.0 garantindo o float32 (casas decimais precisas)[cite: 2]
-            disp_float = filtered_disp.astype(np.float32) / 16.0
-        else:
-            left_disp = self.left_matcher.compute(gl, gr)
-            disp_float = left_disp.astype(np.float32) / 16.0
+   
+        left_disp = self.left_matcher.compute(gl, gr)
+        disp_float = left_disp.astype(np.float32) / 16.0
 
         # Remove valores inválidos (buracos sem textura ou bordas ocluídas)
         disp_float[disp_float < self.min_d] = 0

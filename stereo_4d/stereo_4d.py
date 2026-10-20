@@ -1,9 +1,11 @@
+import copy as copy_module
 import json
 import platform
 import subprocess
 import threading
 import time
 import traceback
+from collections import deque
 from threading import Timer
 from typing import Tuple, Dict
 
@@ -20,11 +22,48 @@ class RepeatTimer(Timer):
             self.function(*self.args, **self.kwargs)
 
 
+# Exposure labels, matching stereo_cam.py on the camera.
+EXPOSURE_SHORT = "short"
+EXPOSURE_LONG = "long"
+EXPOSURE_UNKNOWN = "unknown"
+
+# How far back get_exposure_fps() looks. Long enough that a 15Hz label is a couple of dozen
+# samples, short enough to show a stall while it is still happening.
+EXPOSURE_FPS_WINDOW_SEC = 2.0
+
+# Arrival timestamps kept per label. Sized for the window above at a generous frame rate, so
+# the window is never truncated by the buffer.
+ARRIVAL_HISTORY = 256
+
+# Messages drained per receiver tick before yielding. High enough to catch up after a stall,
+# bounded so a flood cannot hold the thread forever.
+RECEIVE_BATCH = 16
+
+
 class Stereo4DFrame:
-    def __init__(self, timestamp=None, frame_id=None, image=None):
+    def __init__(self, timestamp=None, frame_id=None, image=None, exposure=None):
         self.timestamp = timestamp
         self.frame_id = frame_id
         self.image = image
+        # Which of the two exposures this frame is, and what the sensor actually used to
+        # take it:
+        #   {"label": "short"|"long"|"unknown",
+        #    "left":  {"exposure_time_us", "analogue_gain"},
+        #    "right": {...},
+        #    "lux": ...}
+        # The camera reports what it measured, never what was requested, so a frame caught
+        # while an exposure change was still landing is labelled "unknown" instead of guessed.
+        self.exposure = exposure if exposure is not None else {}
+
+    @property
+    def exposure_label(self):
+        """"short", "long", or "unknown"."""
+        return self.exposure.get("label") or EXPOSURE_UNKNOWN
+
+    @property
+    def exposure_time_us(self):
+        """Exposure the left eye actually used, in microseconds."""
+        return (self.exposure.get("left") or {}).get("exposure_time_us")
 
     def copy(self):
         """Create a copy of the frame"""
@@ -32,6 +71,7 @@ class Stereo4DFrame:
             timestamp=self.timestamp,
             frame_id=self.frame_id,
             image=self.image.copy() if self.image is not None else None,
+            exposure=copy_module.deepcopy(self.exposure),
         )
 
     def __repr__(self):
@@ -40,6 +80,7 @@ class Stereo4DFrame:
             f"    timestamp={self.timestamp},\n"
             f"    frame_id={self.frame_id}\n"
             f"    frame_shape={self.image.shape if self.image is not None else None}\n"
+            f"    exposure={self.exposure}\n"
             f")"
         )
 
@@ -91,7 +132,7 @@ class Stereo4DCameraHandler:
         # status variables
         self.__handler_status = "stop"  # stop, start
         self.__last_status_time = None  # Track last status time
-        self.__status_timeout = 30.0  # Timeout in seconds
+        self.__status_timeout = 20.0  # Timeout in seconds
         self.__run_interval = 1.0  # Check every second
 
         # stereo rectification maps
@@ -121,7 +162,7 @@ class Stereo4DCameraHandler:
         self.__connected_event = threading.Event()
         self.__frame_event = threading.Event()
         self.__show_stream = show_stream
-        self.__logger = CustomLogger("Stereo4DCameraHandler")
+        self.__logger = CustomLogger("FourDCameraHandler")
 
         # zmq setup
         self.sub_socket = None
@@ -132,6 +173,13 @@ class Stereo4DCameraHandler:
         # frame and intrinsics
         self.__last_frame = None
         self.__intrinsics_count = 0
+
+        # Dual exposure. The camera interleaves the two exposures on one stream, so keep the
+        # newest of each: a consumer wants the latest short AND the latest long, not
+        # whichever happened to arrive last.
+        self.__last_frame_by_label = {}
+        self.__label_arrival_times = {}
+        self.__exposure_stats = {}
 
         # fps counting
         self.__fps_measurement_interval = 5.0  # Interval in seconds
@@ -144,6 +192,7 @@ class Stereo4DCameraHandler:
         self.__right_camera_info_callback = None
         self.__intrinsics_callback = None
         self.__frame_callback = None
+        self.__frame_callback_copy = True
 
         # should exit flag to stop the system
         self.__should_exit = False
@@ -160,7 +209,7 @@ class Stereo4DCameraHandler:
         # start the run thread
         self.__run_thread = threading.Thread(target=self.__run)
         self.__run_thread.start()
-        self.__logger.info("Stereo 4D initialized")
+        self.__logger.info("FourDCameraHandler initialized")
 
     def get_fps(self):
         """Get the current frames per second (FPS)"""
@@ -168,13 +217,74 @@ class Stereo4DCameraHandler:
             return None
         return self.__received_fps
 
-    def get_last_frame(self):
-        """Get the last received frame"""
-        if self.__last_frame is None:
-            return None
+    def get_last_frame(self, exposure=None):
+        """Get the last received frame.
 
-        # return a copy of the last frame
-        return self.__last_frame.copy()
+        Args:
+            exposure (str, optional): "short" or "long" to get the newest frame of that
+                exposure. None (default) returns the newest frame of either.
+        """
+        if exposure is None:
+            if self.__last_frame is None:
+                return None
+            return self.__last_frame.copy()
+
+        frame = self.__last_frame_by_label.get(exposure)
+        if frame is None:
+            return None
+        return frame.copy()
+
+    def get_exposure_fps(self):
+        """Measured delivery rate of each exposure, in Hz, over one common window.
+
+        Both exposures come off one sensor stream, so each lands at about half the camera
+        frame rate. A label sitting near zero means it is not reaching this client.
+
+        The window is a fixed number of seconds, the same for both labels. Counting the last
+        N arrivals of each instead made the two numbers span different stretches of time --
+        the slow label averaged over several seconds while the fast one averaged over one --
+        so they described different moments and could sum to more than the frame rate. Two
+        rates that cannot be compared are worse than no rates.
+        """
+        cutoff = time.time() - EXPOSURE_FPS_WINDOW_SEC
+        rates = {}
+        for label, times in self.__label_arrival_times.items():
+            # Counted over the whole window, not over the gap between the first and last
+            # arrival inside it: a label that stopped halfway through has to read low, and
+            # spanning only its own arrivals would report the rate it had while it lasted.
+            rates[label] = sum(1 for t in times if t >= cutoff) / EXPOSURE_FPS_WINDOW_SEC
+        return rates
+
+    def get_exposure_stats(self):
+        """Exposure telemetry from the camera, refreshed with every 1Hz status message.
+
+        Always present:
+
+            ``ae_mode``            the mode in force: manual / normal / highlight / ae_dual
+            ``short_us``           the manual targets and gains, kept whatever mode runs
+            ``long_us``            (so ``set_auto_exposure("manual")`` resumes them)
+            ``short_gain``
+            ``long_gain``
+            ``measured``           per label, what the sensor actually settled on
+            ``unknown_percent``    frames that could not be labelled, so were dropped
+            ``out_of_sync_percent``  pairs dropped for the eyes being too far apart in time
+
+        Mode-specific, and meaningless outside it:
+
+            ``cadence_percent``    the two dual-exposure modes -- how often a frame came
+                                   back wearing the exposure the cadence asked for. Low
+                                   means the control is landing on the wrong frame.
+            ``ae``                 the auto modes -- per label, what its controller last
+                                   metered: ``brightness``, ``setpoint``, ``clipped`` and
+                                   ``rail`` (None / "floor" / "ceiling"). Empty under
+                                   ``manual``.
+            ``ae_railed``          the auto modes -- a controller is asking for more light
+                                   than its band can give. In a dark theatre this means the
+                                   frame rate is the limit: lower the fps and the long
+                                   exposure gets more room. Ceiling rails only; a floor rail
+                                   is a bright scene and is not reported here.
+        """
+        return dict(self.__exposure_stats)
 
     def get_resolution(self):
         """Get the camera resolution"""
@@ -197,6 +307,88 @@ class Stereo4DCameraHandler:
         else:
             return True
 
+    def __send_command(self, payload, description):
+        try:
+            message = json.dumps(payload).encode()
+            self.pub_socket.send_multipart([b"command", message], zmq.NOBLOCK)
+            return True
+        except Exception as e:
+            self.__logger.error(f"Failed to send {description}: {e}")
+            return False
+
+    def set_exposure_pair(self, short_us=None, long_us=None, short_gain=None,
+                          long_gain=None):
+        """Set the two exposure targets the camera alternates between.
+
+        Absolute microseconds, pushed straight at the sensor with the AE off. Every change
+        lands on the next frame -- nothing here rebuilds the camera.
+
+        The camera starts with its AE running, so **this is also what turns dual exposure on**.
+        Sending it once is enough; the camera stays in dual for as long as this connection
+        lasts, and returns to auto when the connection ends. A client that never calls this
+        gets the single auto-metered stream the camera has always produced.
+
+        Args:
+            short_us (int): short exposure target in microseconds, for the bright light
+                (the surgical beam).
+            long_us (int): long exposure target in microseconds, for the rest of the room.
+            short_gain (float): analogue gain for the short exposure.
+            long_gain (float): analogue gain for the long exposure.
+
+        Both targets are clamped below the camera's frame period, so at 30 fps neither can
+        exceed 31333us. Setting short_us equal to long_us asks for a single exposure.
+        """
+        payload = {"action": "set_exposure_pair"}
+        for key, value in (
+            ("short_us", short_us), ("long_us", long_us),
+            ("short_gain", short_gain), ("long_gain", long_gain),
+        ):
+            if value is not None:
+                payload[key] = value
+        self.__logger.info(f"Sending set_exposure_pair command: {payload}")
+        return self.__send_command(payload, "exposure pair command")
+
+    def set_auto_exposure(self, mode="normal"):
+        """Pick the exposure mode. Every switch lands on the next frame.
+
+        None of the four rebuilds the camera. The sensor is driven identically in all of
+        them -- the AE inside the ISP is never used -- so a mode only changes who writes the
+        two targets. ``ae_dual`` used to cost a ~1.5s teardown because it ran on the ISP's
+        HDR, and HdrMode is a configure-time control; that is gone.
+
+        Args:
+            mode (str): one of
+
+                ``"manual"``     the pair from :meth:`set_exposure_pair`, alternating,
+                                 15Hz each. Nothing adapts.
+                ``"normal"``     one exposure, whole-frame metering. 30Hz. The default.
+                ``"highlight"``  one exposure, metering the beam. 30Hz.
+                ``"ae_dual"``    both, alternating, 15Hz each -- short metered like
+                                 highlight, long like normal.
+
+        The three auto modes run a control loop on the camera, not the ISP's AGC, and one
+        loop serves both eyes, so left and right always get identical exposures. Under the
+        single-exposure modes every frame arrives labelled ``"short"``.
+
+        What each mode aims for is in the camera's ``config/exposure.yaml``, which documents
+        every value; the reasoning is in the firmware README.
+        """
+        self.__logger.info(f"Sending set_auto_exposure command: mode={mode}")
+        return self.__send_command(
+            {"action": "set_auto_exposure", "mode": str(mode)}, "auto exposure command"
+        )
+
+    def set_awb_gains(self, gains):
+        """Pin the white balance to (red, blue) gains, or pass None to let AWB run.
+
+        Worth pinning with two exposures: AWB is a single loop across both, so it hunts
+        between the beam-lit and room-lit frames and neither gets the right gains.
+        """
+        self.__logger.info(f"Sending set_awb command: gains={gains}")
+        return self.__send_command(
+            {"action": "set_awb", "gains": list(gains) if gains else None}, "awb command"
+        )
+
     def start(self, wait=True, timeout=None):
 
         self.__should_exit = False
@@ -204,19 +396,11 @@ class Stereo4DCameraHandler:
         self.__handler_status = "starting"
 
         # start the camera thread
-        if self.__start_sequence_thread is None:
-            self.__start_sequence_thread = threading.Thread(
-                target=self.__start_sequence
-            )
-            self.__start_sequence_thread.start()
-        elif not self.__start_sequence_thread.is_alive():
-            self.__start_sequence_thread = threading.Thread(
-                target=self.__start_sequence
-            )
-            self.__start_sequence_thread.start()
-        else:
+        if self.__start_sequence_thread is not None and self.__start_sequence_thread.is_alive():
             self.__logger.warn("Requested to start camera, but it is already starting.")
             return False
+        self.__start_sequence_thread = threading.Thread(target=self.__start_sequence)
+        self.__start_sequence_thread.start()
 
         # if wait is True, wait for the camera to start
         if wait:
@@ -307,8 +491,22 @@ class Stereo4DCameraHandler:
     def set_intrinsics_callback(self, callback):
         self.__intrinsics_callback = callback
 
-    def set_frame_callback(self, callback):
+    def set_frame_callback(self, callback, copy=True):
+        """Call `callback` with each decoded frame.
+
+        Args:
+            callback: called with a Stereo4DFrame per frame, on the receiver thread.
+            copy (bool): hand the callback its own copy of the frame. True by default,
+                which is what every caller written before this argument existed expects.
+
+                Pass False only if the callback will not write into `frame.image`. The
+                frame is freshly built for this call and the SDK does not touch it again,
+                but the same array is what `get_last_frame()` hands out, so a callback that
+                draws on it corrupts what every other consumer sees. Skipping the copy is
+                worth about 1 ms and 12 MB per frame at 1080p stereo.
+        """
         self.__frame_callback = callback
+        self.__frame_callback_copy = bool(copy)
 
     def __ping(self, host):
         param = "-n" if platform.system().lower() == "windows" else "-c"
@@ -533,13 +731,6 @@ class Stereo4DCameraHandler:
             self.__logger.error(f"Failed to decode frame: {e}")
             return None
 
-    def __decode_string(self, string_bytes):
-        try:
-            return string_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            self.__logger.error("Failed to decode string")
-            return None
-
     def __handle_frame_message(self, msg_json: Dict):
 
         self.__frame_count_total += 1
@@ -547,19 +738,18 @@ class Stereo4DCameraHandler:
         # handle timestamp
         timestamp = msg_json.get("timestamp", None)
 
-        # decode image
-        image_bytes = bytes.fromhex(msg_json.get("data", ""))
+        # decode image. Newer firmware sends the JPEG as a second ZMQ frame (already bytes);
+        # older firmware hex-encoded it into this field.
+        data = msg_json.get("data", "")
+        image_bytes = data if isinstance(data, (bytes, bytearray)) else bytes.fromhex(data)
         image = self.__decode_frame(image_bytes)
         if image is None:
             self.__frame_drop_count += 1
-            self.__frame_drop_percent = (
-                self.__frame_drop_count / (self.__frame_count_total + 1e-6)
-            ) * 100
-            return
-
         self.__frame_drop_percent = (
-            self.__frame_drop_count / (self.__frame_count_total + 1e-6)
-        ) * 100
+            100.0 * self.__frame_drop_count / (self.__frame_count_total + 1e-6)
+        )
+        if image is None:
+            return
 
         if self.rectify_internally and self.stereo_maps_set:
             # Decode the image into left and right images
@@ -577,22 +767,56 @@ class Stereo4DCameraHandler:
         frame = Stereo4DFrame(
             timestamp=timestamp,
             image=image,
+            exposure=self.__parse_exposure(msg_json),
         )
 
         self.__last_frame = frame
+        self.__record_exposure_arrival(frame)
+        self.__frame_count_in_interval += 1
+        self.__frame_event.set()
 
         current_time = time.time()
         elapsed_time = current_time - self.__prev_fps_measured_time
 
-        # clear and set the frame event
-        self.__frame_event.set()
         if elapsed_time >= self.__fps_measurement_interval:
             self.__prev_fps_measured_time = current_time
             self.__received_fps = self.__frame_count_in_interval / elapsed_time
             self.__frame_count_in_interval = 0
 
         if self.__frame_callback:
-            self.__frame_callback(frame.copy())
+            self.__frame_callback(frame.copy() if self.__frame_callback_copy else frame)
+
+    @staticmethod
+    def __parse_exposure(msg_json: Dict):
+        """Per-frame exposure the camera reported, split per eye."""
+        def per_eye(key):
+            value = msg_json.get(key)
+            if isinstance(value, dict):
+                return value.get("left"), value.get("right")
+            # Older firmware reported a single value for the pair.
+            return value, value
+
+        left_time, right_time = per_eye("exposure_time_us")
+        left_gain, right_gain = per_eye("analogue_gain")
+        return {
+            "label": msg_json.get("exposure") or EXPOSURE_UNKNOWN,
+            "lux": msg_json.get("lux"),
+            "left": {"exposure_time_us": left_time, "analogue_gain": left_gain},
+            "right": {"exposure_time_us": right_time, "analogue_gain": right_gain},
+        }
+
+    def __record_exposure_arrival(self, frame: Stereo4DFrame):
+        """Keep the newest frame of each exposure, and measure how fast each one arrives."""
+        label = frame.exposure_label
+        if label == EXPOSURE_UNKNOWN:
+            return
+        self.__last_frame_by_label[label] = frame
+        times = self.__label_arrival_times.get(label)
+        if times is None:
+            # Enough for the whole window even if one label carries the entire stream.
+            times = deque(maxlen=ARRIVAL_HISTORY)
+            self.__label_arrival_times[label] = times
+        times.append(time.time())
 
     def __handle_intrinsics_message(self, msg_json: Dict):
         # handle timestamp
@@ -642,10 +866,15 @@ class Stereo4DCameraHandler:
                 self.left_camera_info.copy(), self.right_camera_info.copy()
             )
 
-    def __handle_camera_status(self):
+    def __handle_camera_status(self, msg_json: Dict = None):
 
         # Update last status time
         self.__last_status_time = time.time()
+
+        if msg_json:
+            stats = msg_json.get("exposure_stats")
+            if stats:
+                self.__exposure_stats = stats
 
     def __handle_message(self, msg_json: Dict):
         try:
@@ -661,25 +890,41 @@ class Stereo4DCameraHandler:
             elif msg_type == "intrinsics":
                 self.__handle_intrinsics_message(msg_json)
             elif msg_type == "status":
-                self.__handle_camera_status()
+                self.__handle_camera_status(msg_json)
         except Exception as e:
             self.__logger.error(f"Error handling message: {e}")
             traceback.print_exc()
 
     def __receiver(self):
+        """Drain what has arrived, rather than one message per tick.
+
+        This used to take exactly one message per timer interval, so the interval was added to
+        every frame's decode: at 10ms plus ~25ms to decode a stereo JPEG the client could not
+        take 30Hz however fast the camera ran. The publisher discards what does not fit at its
+        high-water mark and says nothing, so falling behind here looked like a camera that had
+        stopped producing one of the two exposures.
+        """
         try:
             if self.sub_socket is None:
                 time.sleep(1)
                 return
 
-            # Use a small timeout to prevent blocking
-            msg_json = self.sub_socket.recv_json()
-            if msg_json and not self.__should_exit:  # Check should_exit again after receive
-                self.__handle_message(msg_json)
+            for _ in range(RECEIVE_BATCH):
+                if self.__should_exit:
+                    return
+                parts = self.sub_socket.recv_multipart()
+                if not parts:
+                    return
+                msg_json = json.loads(parts[0])
+                if len(parts) > 1:
+                    # The JPEG rides as its own ZMQ frame; hex in the JSON was twice the size.
+                    msg_json["data"] = parts[1]
+                if msg_json and not self.__should_exit:
+                    self.__handle_message(msg_json)
         except zmq.error.ContextTerminated:
             return
         except zmq.error.Again:
-            # No message available, continue
+            # Nothing left to drain.
             return
         except Exception as e:
             self.__logger.error(f"Error in receiver loop: {e}")
@@ -705,7 +950,7 @@ class Stereo4DCameraHandler:
             right_dist_coeffs,
             (1920, 1080),  # Assuming image resolution TODO
             extrinsic_matrix[:3, :3],  # Rotation matrix
-            extrinsic_matrix[:3, 3],  # Translation vector
+            extrinsic_matrix[:3, 3].reshape(3, 1),  # Translation vector (OpenCV needs 3x1)
             alpha=alpha,
             flags=cv2.CALIB_ZERO_DISPARITY,
             newImageSize=(1920, 1080),  # Assuming image resolution TODO
@@ -726,20 +971,6 @@ class Stereo4DCameraHandler:
         self.__logger.info(
             "Stereo rectification maps initialized successfully with the following parameters:"
         )
-
-        # TODO
-        myQ = np.array(
-            [
-                [1, 0, 0, -self.left_rect_k[0, 2]],
-                [0, 1, 0, -self.left_rect_k[1, 2]],
-                [0, 0, 0, self.left_rect_k[0, 0]],
-                [0, 0, 1 / 0.3, 0],
-                # Assuming a baseline of 0.3 meters, adjust as needed
-            ]
-        )
-        self.__logger.info("Custom Q matrix:")
-        self.__logger.info(f"{myQ}")
-
         self.__logger.info(f"Left Raw Matrix:\n{np.array2string(left_k, precision=2, suppress_small=True)}")
         self.__logger.info(f"Right Raw Matrix:\n{np.array2string(right_k, precision=2, suppress_small=True)}")
         self.__logger.info(f"Left Rect Matrix:\n{np.array2string(self.left_rect_k, precision=2, suppress_small=True)}")
@@ -774,30 +1005,16 @@ class Stereo4DCameraHandler:
 
     def __show_stream_loop(self):
         cv2.namedWindow("Stream", cv2.WINDOW_NORMAL)
-
-        fps = 0
         while not self.__should_exit:
-            if self.__last_frame is not None:
-                img = self.__last_frame.image.copy()
-
-                fps = self.get_fps()
-                fps = fps if fps is not None else 0
-
-                # show fps
-                cv2.putText(
-                    img,
-                    f"FPS: {int(fps)}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 255, 0),
-                    2,
-                )
-
-                cv2.imshow("Stream", img)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
+            frame = self.__last_frame
+            if frame is None or frame.image is None:
+                # waitKey is the only thing that sleeps in this loop; without it the wait
+                # for the first frame spins a core flat.
+                time.sleep(0.01)
+                continue
+            cv2.imshow("Stream", frame.image.copy())
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
         cv2.destroyAllWindows()
 
     def __del__(self):
@@ -805,7 +1022,11 @@ class Stereo4DCameraHandler:
         try:
             self.stop()
         except Exception as e:
-            self.__logger.error(f"Error in destructor: {e}")
+            # A handler that failed partway through __init__ has no logger yet, and
+            # reaching for one here turns a cleanup problem into a second exception.
+            logger = getattr(self, "_Stereo4DCameraHandler__logger", None)
+            if logger is not None:
+                logger.error(f"Error in destructor: {e}")
 
 
 if __name__ == "__main__":
